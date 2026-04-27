@@ -1,33 +1,29 @@
-import json
 import os
+from datetime import datetime
+
+import gspread
 import pandas as pd
 import streamlit as st
-import gspread
-from google.oauth2.service_account import Credentials
-from openpyxl import load_workbook
-from datetime import datetime
 
 st.set_page_config(page_title="Гант Гарант 2026", layout="wide")
 
-# ===== НАСТРОЙКИ =====
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1DlgMbUkXySIBtQIT8n0k0hdN5qJeYxBFpc-R8a9FYm4/edit?usp=sharing"
 SHEET_NAME = "Диаграмма Ганта Гарнт 2026"
 
-# ===== СТИЛИ =====
 st.markdown("""
 <style>
 .card {
-    padding: 22px;
+    padding: 24px;
     border-radius: 18px;
     color: #111;
-    font-size: 20px;
+    font-size: 30px;
     font-weight: 600;
     box-shadow: 0 4px 14px rgba(0,0,0,0.08);
 }
 .card-number {
-    font-size: 38px;
+    font-size: 48px;
     font-weight: 800;
-    margin-top: 8px;
+    margin-top: 10px;
 }
 .red { background: #ffd6d6; }
 .yellow { background: #fff1b8; }
@@ -37,13 +33,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-
 def read_google_sheet(sheet_url):
     if os.path.exists("credentials.json"):
-        # Локальный запуск на твоём компьютере
         gc = gspread.service_account(filename="credentials.json")
     else:
-        # Запуск в Streamlit Cloud
         service_account_info = dict(st.secrets["gcp_service_account"])
         service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
         gc = gspread.service_account_from_dict(service_account_info)
@@ -51,252 +44,388 @@ def read_google_sheet(sheet_url):
     sh = gc.open_by_url(sheet_url)
     ws = sh.worksheet(SHEET_NAME)
 
-    data = ws.get_all_values()
+    # ВАЖНО: UNFORMATTED_VALUE сохраняет числа как числа
+    data = ws.get("A1:O", value_render_option="UNFORMATTED_VALUE")
     return pd.DataFrame(data)
 
+
 def parse_date(value):
-    if pd.isna(value) or value == "":
+    if pd.isna(value) or str(value).strip() == "":
         return pd.NaT
-    return pd.to_datetime(value, errors="coerce")
+    return pd.to_datetime(value, dayfirst=True, errors="coerce")
 
 
 def parse_percent(value):
-    if pd.isna(value) or value == "":
+    if pd.isna(value) or str(value).strip() == "":
         return pd.NA
 
-    if isinstance(value, str):
-        value = value.replace("%", "").replace(",", ".").strip()
-        try:
-            number = float(value)
-        except ValueError:
-            return pd.NA
-    elif isinstance(value, (int, float)):
+    value = str(value).replace("%", "").replace(",", ".").strip()
+
+    try:
         number = float(value)
-    else:
+    except ValueError:
         return pd.NA
 
-    if number > 1:
-        return number / 100
+    return number / 100 if number > 1 else number
 
-    return number
+
+def is_number(value):
+    try:
+        float(value)
+        return True
+    except Exception:
+        return False
 
 
 def prepare_data(df):
+    raw = df.copy().reset_index(drop=True)
+
+    # На всякий случай расширяем таблицу до 15 колонок, если Google вернул меньше
+    while raw.shape[1] < 15:
+        raw[raw.shape[1]] = ""
+
     gantt = pd.DataFrame()
 
-    # A = 0, B = 1, H = 7, I = 8, L = 11, M = 12
-    gantt["A"] = df.iloc[:, 0]
-    gantt["B"] = df.iloc[:, 1]
-    gantt["H_deadline"] = df.iloc[:, 7]
-    gantt["I_fact"] = df.iloc[:, 8]
-    gantt["L_status"] = df.iloc[:, 11]
-    gantt["M_progress"] = df.iloc[:, 12]
+    # A = 0, B = 1, C = 2, H = 7, I = 8, L = 11, M = 12
+    gantt["A"] = raw.iloc[:, 0]
+    gantt["B"] = raw.iloc[:, 1]
+    gantt["C_function"] = raw.iloc[:, 2]
+    gantt["H_deadline"] = raw.iloc[:, 7]
+    gantt["I_fact"] = raw.iloc[:, 8]
+    gantt["L_status"] = raw.iloc[:, 11]
+    gantt["M_progress"] = raw.iloc[:, 12]
 
-    # с 6 строки Excel
-    gantt = gantt.iloc[5:].copy()
+    gantt["row_number"] = gantt.index + 1
 
-    gantt["deadline"] = gantt["H_deadline"].apply(parse_date)
-    gantt["fact_date"] = gantt["I_fact"].apply(parse_date)
-    gantt["progress"] = gantt["M_progress"].apply(parse_percent)
+    gantt["A_text"] = gantt["A"].astype(str).str.strip()
+    gantt["B_text"] = gantt["B"].astype(str).str.strip()
+    gantt["function"] = gantt["C_function"].astype(str).str.strip()
 
-    gantt["status"] = gantt["L_status"].astype(str).str.strip()
-    gantt["task_name"] = gantt["B"].astype(str).str.strip()
+    # Убираем служебные пустые значения
+    for col in ["A_text", "B_text", "function"]:
+        gantt[col] = gantt[col].replace(["nan", "None", "<NA>"], "")
 
-    # Этап — когда в A число
-    gantt["is_stage"] = pd.to_numeric(gantt["A"], errors="coerce").notna()
+    # Строки до 6-й строки не учитываем, как в формуле A6:A
+    gantt = gantt[gantt["row_number"] >= 6].copy()
 
+    # Этап = в A целое число: 0, 1, 2, 3...
+    gantt["A_number"] = pd.to_numeric(
+        gantt["A_text"].str.replace(",", ".", regex=False),
+        errors="coerce"
+    )
+
+    gantt["is_stage"] = (
+        gantt["A_number"].notna()
+        & (gantt["A_number"] % 1 == 0)
+        & (gantt["B_text"] != "")
+    )
+
+    # Задача = A не пустая и не число
+    gantt["is_task"] = (
+        (gantt["A_text"] != "")
+        & ~gantt["is_stage"]
+    )
+
+    # ПРОСМОТР: протягиваем номер и название этапа вниз
     gantt["stage_num"] = pd.NA
     gantt["stage_name"] = pd.NA
 
-    gantt.loc[gantt["is_stage"], "stage_num"] = gantt.loc[gantt["is_stage"], "A"]
-    gantt.loc[gantt["is_stage"], "stage_name"] = gantt.loc[gantt["is_stage"], "B"]
+    gantt.loc[gantt["is_stage"], "stage_num"] = gantt.loc[gantt["is_stage"], "A_number"].astype("Int64")
+    gantt.loc[gantt["is_stage"], "stage_name"] = gantt.loc[gantt["is_stage"], "B_text"]
 
     gantt["stage_num"] = gantt["stage_num"].ffill()
     gantt["stage_name"] = gantt["stage_name"].ffill()
 
-    # Задача — строка, где A текстовая и не пустая
-    gantt["is_task"] = (
-        gantt["A"].notna()
-        & ~gantt["is_stage"]
-        & (gantt["A"].astype(str).str.strip() != "")
-    )
+    gantt["task_name"] = gantt["B_text"]
+    gantt["deadline"] = gantt["H_deadline"].apply(parse_date)
+    gantt["fact_date"] = gantt["I_fact"].apply(parse_date)
+    gantt["status"] = gantt["L_status"].astype(str).str.strip()
+    gantt["progress"] = gantt["M_progress"].apply(parse_percent)
 
     return gantt
 
 
-def calculate_kpi(gantt, full_df):
+def calculate_kpi(gantt):
     today = pd.Timestamp.today().normalize()
     three_days = today + pd.Timedelta(days=3)
 
-    has_task_name = gantt["B"].notna() & (gantt["B"].astype(str).str.strip() != "")
-    not_completed = gantt["status"].str.lower() != "завершено"
+    tasks = gantt[gantt["is_task"]].copy()
 
-    overdue = gantt[
-        (gantt["deadline"] < today)
-        & gantt["deadline"].notna()
-        & not_completed
-        & has_task_name
+    has_name = tasks["task_name"].astype(str).str.strip() != ""
+    not_done = tasks["status"].str.lower() != "завершено"
+
+    overdue = tasks[
+        has_name
+        & not_done
+        & tasks["deadline"].notna()
+        & (tasks["deadline"] < today)
     ].shape[0]
 
-    risk = gantt[
-        (gantt["deadline"] >= today)
-        & (gantt["deadline"] <= three_days)
-        & gantt["deadline"].notna()
-        & not_completed
-        & has_task_name
+    risk = tasks[
+        has_name
+        & not_done
+        & tasks["deadline"].notna()
+        & (tasks["deadline"] >= today)
+        & (tasks["deadline"] <= three_days)
     ].shape[0]
 
-    completed = gantt[
-        (gantt["status"].str.lower() == "завершено")
-        & has_task_name
+    completed = tasks[
+        has_name
+        & (tasks["status"].str.lower() == "завершено")
     ].shape[0]
 
-    progress_values = full_df.iloc[2:, 12].apply(parse_percent).dropna()
+    progress_values = tasks["progress"].dropna()
     project_progress = progress_values.mean() if len(progress_values) else 0
 
     return overdue, risk, completed, project_progress
 
 
-# ===== ИНТЕРФЕЙС =====
+# ===== ЗАГРУЗКА ДАННЫХ =====
 st.title("📊 Гант Гарант 2026")
+st.markdown("""
+<style>
 
-sheet_url = st.text_input(
-    "Ссылка на Google Таблицу",
-    value=GOOGLE_SHEET_URL
-)
+/* ===== ФИЛЬТРЫ (жёсткое переопределение) ===== */
+div[data-baseweb="select"] span[data-baseweb="tag"] {
+    background-color: #00E755 !important;
+    color: #003138 !important;
+    border: none !important;
+}
 
-full_df = read_google_sheet(sheet_url)
-gantt = prepare_data(full_df)
+/* текст внутри */
+div[data-baseweb="select"] span[data-baseweb="tag"] span {
+    color: #003138 !important;
+}
 
-overdue, risk, completed, project_progress = calculate_kpi(gantt, full_df)
+/* крестик */
+div[data-baseweb="select"] span[data-baseweb="tag"] svg {
+    fill: #003138 !important;
+}
 
-st.subheader("🎛️ Дашборд")
+/* hover */
+div[data-baseweb="select"] span[data-baseweb="tag"]:hover {
+    background-color: #00c94a !important;
+}
 
-c1, c2, c3, c4 = st.columns(4)
+</style>
+""", unsafe_allow_html=True)
+try:
+    full_df = read_google_sheet(GOOGLE_SHEET_URL)
+    gantt = prepare_data(full_df)
 
-with c1:
-    st.markdown(f"""
-    <div class="card red">
-        🔴 Просроченные
-        <div class="card-number">{overdue}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    overdue, risk, completed, project_progress = calculate_kpi(gantt)
 
-with c2:
-    st.markdown(f"""
-    <div class="card yellow">
-        ⚠️ Риск 3 дня
-        <div class="card-number">{risk}</div>
-    </div>
-    """, unsafe_allow_html=True)
+except Exception as e:
+    st.error("Не удалось загрузить данные из Google Sheets.")
+    st.code(str(e))
+    st.stop()
 
-with c3:
-    st.markdown(f"""
-    <div class="card green">
-        ✅ Завершено
-        <div class="card-number">{completed}</div>
-    </div>
-    """, unsafe_allow_html=True)
 
-with c4:
-    st.markdown(f"""
-    <div class="card gray">
-        📈 Прогресс проекта
-        <div class="card-number">{project_progress:.0%}</div>
-    </div>
-    """, unsafe_allow_html=True)
+# ===== ПЕРЕКЛЮЧАТЕЛЬ =====
+col_left, col_toggle, col_right = st.columns([1.1, 0.35, 2.5])
+
+with col_left:
+    st.markdown("### 🎛️ Дашборд")
+
+with col_toggle:
+    plan_fact_mode = st.toggle(
+        "mode",
+        value=False,
+        label_visibility="collapsed"
+    )
+
+with col_right:
+    st.markdown("### 📈 План VS ФАКТ")
+
+page = "📈 План VS ФАКТ" if plan_fact_mode else "🎛️ Дашборд"
+
+
+# ===== KPI =====
+k1, k2, k3, k4 = st.columns(4)
+
+with k1:
+    st.markdown(
+        f'<div class="card red">🔴 Просроченные<div class="card-number">{overdue}</div></div>',
+        unsafe_allow_html=True
+    )
+
+with k2:
+    st.markdown(
+        f'<div class="card yellow">⚠️ Риск 3 дня<div class="card-number">{risk}</div></div>',
+        unsafe_allow_html=True
+    )
+
+with k3:
+    st.markdown(
+        f'<div class="card green">✅ Завершено<div class="card-number">{completed}</div></div>',
+        unsafe_allow_html=True
+    )
+
+with k4:
+    st.markdown(
+        f'<div class="card gray">📈 Прогресс проекта<div class="card-number">{project_progress:.0%}</div></div>',
+        unsafe_allow_html=True
+    )
 
 st.divider()
 
-# ===== СВОДНАЯ ПО ЭТАПАМ =====
-st.subheader("🚀 Сводная по этапам")
 
+# ===== ОБЩИЕ ДАННЫЕ =====
 tasks = gantt[gantt["is_task"]].copy()
 
-stages = sorted(tasks["stage_name"].dropna().unique())
+tasks = tasks[
+    tasks["task_name"].notna()
+    & (tasks["task_name"].astype(str).str.strip() != "")
+]
 
-selected_stages = st.multiselect(
-    "Фильтр по этапам",
-    options=stages,
-    default=stages
+all_stages = sorted(
+    tasks[
+        tasks["stage_name"].notna()
+        & (tasks["stage_name"].astype(str).str.strip() != "")
+        & (~tasks["stage_name"].astype(str).str.lower().isin(["nan", "<na>", "none"]))
+    ]["stage_name"].unique()
 )
 
-filtered_tasks = tasks[tasks["stage_name"].isin(selected_stages)]
 
-stage_summary = (
-    filtered_tasks
-    .groupby(["stage_num", "stage_name"], dropna=False)
-    .agg(
-        **{
-            "Кол-во задач": ("task_name", "count"),
-            "Прогресс": ("progress", "mean")
-        }
-    )
-    .reset_index()
-)
+if page == "🎛️ Дашборд":
+    left_col, right_col = st.columns(2)
 
-stage_summary["Прогресс"] = stage_summary["Прогресс"].fillna(0)
-stage_summary["Прогресс, %"] = (stage_summary["Прогресс"] * 100).round(1)
+    with left_col:
+        stages = sorted(tasks["stage_name"].dropna().unique())
 
-if not stage_summary.empty:
-    st.dataframe(
-        stage_summary[
-            ["stage_num", "stage_name", "Кол-во задач", "Прогресс, %"]
-        ].rename(columns={
-            "stage_num": "Номер этапа",
-            "stage_name": "Название этапа"
-        }),
-        width="stretch"
-    )
-
-    st.bar_chart(
-        stage_summary.set_index("stage_name")["Прогресс, %"]
-    )
-else:
-    st.info("Нет данных по этапам для отображения.")
-
-st.divider()
-
-# ===== ПЛАН VS ФАКТ =====
-st.subheader("📈 План vs факт")
-
-plan_fact = filtered_tasks[filtered_tasks["fact_date"].notna()].copy()
-
-if not plan_fact.empty:
-    plan_fact["В срок"] = (
-        plan_fact["fact_date"] <= plan_fact["deadline"]
-    ).astype(int)
-
-    plan_fact["С задержкой"] = (
-        plan_fact["fact_date"] > plan_fact["deadline"]
-    ).astype(int)
-
-    plan_fact_summary = (
-        plan_fact
-        .groupby(["stage_num", "stage_name"], dropna=False)
-        .agg(
-            **{
-                "В срок": ("В срок", "sum"),
-                "С задержкой": ("С задержкой", "sum")
-            }
+        selected_stages = st.multiselect(
+            "Фильтр по этапам",
+            options=stages,
+            default=stages
         )
-        .reset_index()
+
+        filtered_stage_tasks = tasks[tasks["stage_name"].isin(selected_stages)]
+
+        st.subheader("🚀 Сводная по этапам")
+
+        stage_summary = (
+            filtered_stage_tasks
+            .groupby(["stage_num", "stage_name"], dropna=False)
+            .agg({
+                "task_name": "count",
+                "progress": "mean"
+            })
+            .reset_index()
+        )
+
+        stage_summary["progress"] = stage_summary["progress"].fillna(0)
+        stage_summary["Прогресс, %"] = (
+            stage_summary["progress"] * 100
+        ).map(lambda x: f"{x:.2f}%")
+
+        if not stage_summary.empty:
+            st.table(
+                stage_summary.rename(columns={
+                    "stage_num": "Номер этапа",
+                    "stage_name": "Название этапа",
+                    "task_name": "Кол-во задач"
+                })[
+                    ["Номер этапа", "Название этапа", "Кол-во задач", "Прогресс, %"]
+                ]
+            )
+        else:
+            st.info("Нет данных по выбранным этапам.")
+
+    with right_col:
+        functions = sorted(tasks["function"].dropna().unique())
+
+        selected_functions = st.multiselect(
+            "Фильтр по функциям",
+            options=functions,
+            default=functions
+        )
+
+        filtered_function_tasks = tasks[tasks["function"].isin(selected_functions)]
+
+        st.subheader("🧩 Сводная по функциям")
+
+        function_summary = (
+            filtered_function_tasks
+            .groupby("function", dropna=False)
+            .agg({
+                "task_name": "count",
+                "progress": "mean"
+            })
+            .reset_index()
+        )
+
+        function_summary["progress"] = function_summary["progress"].fillna(0)
+        function_summary["Прогресс, %"] = (
+            function_summary["progress"] * 100
+        ).map(lambda x: f"{x:.2f}%")
+
+        if not function_summary.empty:
+            st.table(
+                function_summary.rename(columns={
+                    "function": "Функция",
+                    "task_name": "Кол-во задач"
+                })[
+                    ["Функция", "Кол-во задач", "Прогресс, %"]
+                ]
+            )
+        else:
+            st.info("Нет данных по выбранным функциям.")
+
+
+# ===== PLAN VS FACT =====
+if page == "📈 План VS ФАКТ":
+    st.subheader("📈 Plan vs Fact по этапам")
+
+    selected_stages = st.multiselect(
+        "Фильтр по этапам",
+        options=all_stages,
+        default=all_stages
     )
 
-    st.dataframe(
-        plan_fact_summary.rename(columns={
-            "stage_num": "Этап",
-            "stage_name": "Название"
-        }),
-        width="stretch"
-    )
+    filtered_tasks = tasks[tasks["stage_name"].isin(selected_stages)]
 
-    if not plan_fact_summary.empty:
+    plan_fact = filtered_tasks[filtered_tasks["fact_date"].notna()].copy()
+
+    if not plan_fact.empty:
+        both_dates = plan_fact["deadline"].notna() & plan_fact["fact_date"].notna()
+
+        plan_fact["В срок"] = (
+            both_dates
+            & (plan_fact["fact_date"] <= plan_fact["deadline"])
+        ).astype(int)
+
+        plan_fact["С задержкой"] = (
+            both_dates
+            & (plan_fact["fact_date"] > plan_fact["deadline"])
+        ).astype(int)
+
+        plan_fact_summary = (
+            plan_fact
+            .groupby(["stage_num", "stage_name"], dropna=False)
+            .agg(
+                **{
+                    "В срок": ("В срок", "sum"),
+                    "С задержкой": ("С задержкой", "sum")
+                }
+            )
+            .reset_index()
+        )
+
+        st.dataframe(
+            plan_fact_summary.rename(columns={
+                "stage_num": "Этап",
+                "stage_name": "Название"
+            }),
+            width="stretch",
+            hide_index=True
+        )
+
         st.bar_chart(
             plan_fact_summary.set_index("stage_name")[["В срок", "С задержкой"]]
         )
-else:
-    st.info("Нет данных для блока План vs факт.")
+    else:
+        st.info("Нет данных для блока Plan vs Fact по этапам.")
 
-st.caption(f"Источник: {sheet_url}")
-st.caption(f"Последнее обновление страницы: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+
+st.caption("Источник: Google Sheets")
+st.caption(f"Последнее обновление: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
