@@ -39,11 +39,15 @@ st.markdown("""
 
 
 def read_google_sheet(sheet_url):
-    service_account_info = dict(st.secrets["gcp_service_account"])
+    if os.path.exists("credentials.json"):
+        # Локальный запуск на твоём компьютере
+        gc = gspread.service_account(filename="credentials.json")
+    else:
+        # Запуск в Streamlit Cloud
+        service_account_info = dict(st.secrets["gcp_service_account"])
+        service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
+        gc = gspread.service_account_from_dict(service_account_info)
 
-    service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
-
-    gc = gspread.service_account_from_dict(service_account_info)
     sh = gc.open_by_url(sheet_url)
     ws = sh.worksheet(SHEET_NAME)
 
