@@ -1,3 +1,4 @@
+import json
 import os
 import pandas as pd
 import streamlit as st
@@ -38,7 +39,9 @@ st.markdown("""
 
 
 def read_google_sheet(sheet_url):
-    gc = gspread.service_account(filename="credentials.json")
+    service_account_info = dict(st.secrets["gcp_service_account"])
+
+    gc = gspread.service_account_from_dict(service_account_info)
     sh = gc.open_by_url(sheet_url)
     ws = sh.worksheet(SHEET_NAME)
 
@@ -290,5 +293,5 @@ if not plan_fact.empty:
 else:
     st.info("Нет данных для блока План vs факт.")
 
-st.caption(f"Файл: {file_path}")
+st.caption(f"Источник: {sheet_url}")
 st.caption(f"Последнее обновление страницы: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
